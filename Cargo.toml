@@ -1,0 +1,8 @@
+[package]
+name = "honest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+creusot-contracts = { version = "0.4.0" }
+zeroize = { version = "1.8.1", features = ["derive"] }
