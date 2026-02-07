@@ -40,9 +40,9 @@ fn gf256_exp(mut base: u8, mut exp: u8) -> u8 {
     let mut result = 1u8;
     while exp != 0 {
         if exp & 1 != 0 {
-            result = gf256_mul(result, base);
+            result = gf256_mul_ct(result, base);
         }
-        base = gf256_mul(base, base);
+        base = gf256_mul_ct(base, base);
         exp >>= 1;
     }
     result
