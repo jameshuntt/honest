@@ -1,6 +1,6 @@
 [package]
 name = "honest"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 license = "MIT OR Apache-2.0"
@@ -10,5 +10,12 @@ authors = ["James Hunt <jameshuntdevelopment@gmail.com>"]
 repository = "https://github.com/jameshuntt/honest"
 
 [dependencies]
-creusot-contracts = { version = "0.4.0" }
 zeroize = { version = "1.8.1", features = ["derive"] }
+num-bigint = { version = "0.4.6", features = ["rand"] }
+secrecy = "0.10.3"
+num-traits = "0.2.19"
+num-integer = "0.1.46"
+thiserror = "2.0.12"
+
+
+classified = { version = "0.1.1", default-features = false }
