@@ -76,20 +76,3 @@ mod tests {
         assert_eq!(a, b)
     }
 }
-
-
-// 
-// // Evaluate the polynomial at a given x
-// fn evaluate_polynomial(coefficients: &Vec<BigUint>, x: &BigUint, prime: &BigUint) -> BigUint {
-//     let mut result = BigUint::zero();
-//     let mut power_of_x = BigUint::one();
-// 
-//     for coeff in coefficients {
-//         let term = (coeff * &power_of_x) % prime;
-//         result = (result + term) % prime;
-//         power_of_x = (power_of_x * x) % prime;
-//     }
-// 
-//     result
-// }
-// 
