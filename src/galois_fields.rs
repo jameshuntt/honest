@@ -20,7 +20,7 @@ pub(crate) fn gf256_mul_ct(mut a: u8, mut b: u8) -> u8 {
         b >>= 1;
     }
     result
-}pub fn call_mul_ct(a: u8, b: u8) -> u8 { gf256_mul(a, b) }
+}pub fn call_mul_ct(a: u8, b: u8) -> u8 { gf256_mul_ct(a, b) }
 pub(crate) fn gf256_mul(mut a: u8, mut b: u8) -> u8 {
     let mut result = 0u8;
     while b != 0 {
