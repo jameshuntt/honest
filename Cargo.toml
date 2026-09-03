@@ -1,21 +1,25 @@
 [package]
 name = "honest"
-version = "0.1.4"
-edition = "2024"
-
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.70"
 license = "MIT OR Apache-2.0"
-description = "High-assurance Operations for Number-theoretic Extension Sets and Theorems (Galois Fields)."
-
-authors = ["James Hunt <jameshuntdevelopment@gmail.com>"]
+description = "Finite-field arithmetic that does not branch on secrets: GF(2^8) with the AES polynomial, polynomials over it, and modular big-integer helpers. Math only; no ciphers, no schemes."
+authors = ["James Hunt <james@1o.business>"]
 repository = "https://github.com/jameshuntt/honest"
+readme = "README.md"
+keywords = ["galois-field", "gf256", "finite-field", "constant-time", "polynomial"]
+categories = ["cryptography", "mathematics", "no-std"]
+include = ["src/**", "tests/**", "Cargo.toml", "README.md", "LICENSE-*"]
+
+[features]
+default = ["bigint"]
+# Modular arithmetic over arbitrary-size integers (`modular`) and the zeroizing
+# big-integer wrappers (`secure`). Off, the crate is `no_std` GF(2^8) only.
+bigint = ["dep:num-bigint", "dep:num-traits", "dep:secrecy"]
 
 [dependencies]
-zeroize = { version = "1.8.1", features = ["derive"] }
-num-bigint = { version = "0.4.6", features = ["rand"] }
-secrecy = "0.10.3"
-num-traits = "0.2.19"
-num-integer = "0.1.46"
-thiserror = "2.0.12"
-
-
-classified = { version = "0.1.1", default-features = false }
+zeroize = { version = "1.8", features = ["derive"] }
+num-bigint = { version = "0.4", optional = true }
+num-traits = { version = "0.2", optional = true }
+secrecy = { version = "0.10", optional = true }

@@ -1,0 +1,1651 @@
+// start of types.rs
+pub mod newtypes;
+pub use newtypes::{FieldElement};
+
+pub mod secure_types;
+// end of types.rs
+
+// start of types/secure_types.rs
+use classified::classified_data::ClassifiedData;
+use num_bigint::{BigInt, BigUint};
+use num_traits::Zero;
+use secrecy::SecretBox;
+use zeroize::Zeroize;
+
+#[derive(Clone)]
+pub struct SecureBigUint(pub BigUint);
+
+impl Zeroize for SecureBigUint {
+    fn zeroize(&mut self) {
+        self.0 = BigUint::zero();
+    }
+}
+
+pub type SecretBigUint = SecretBox<SecureBigUint>;
+pub type ClassifiedBigUint = ClassifiedData<BigUint>;
+
+
+#[derive(Clone)]
+pub struct SecureBigInt(pub BigInt);
+
+impl Zeroize for SecureBigInt {
+    fn zeroize(&mut self) {
+        self.0 = BigInt::zero();
+    }
+}
+
+pub type SecretBigInt = SecretBox<SecureBigInt>;
+
+#[derive(Clone)]pub struct SecureBigUint2(pub BigUint);
+
+impl Zeroize for SecureBigUint2 {
+    fn zeroize(&mut self) {
+        // 1. Force a physical copy of the heap limbs into a clean vector
+        let mut digits = self.0.to_u32_digits();
+        
+        // 2. Overwrite the physical memory location with zeros
+        digits.zeroize(); 
+        
+        // 3. Safely update the high-level application state
+        self.0 = BigUint::zero(); 
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_bigint::ToBigUint;
+    use secrecy::{ExposeSecret, SecretBox};
+
+    #[test]
+    fn test_logical_zeroize_vs_structural_zeroize() {
+        // --- Setup initial values ---
+        let raw_val = 1234567890u64.to_biguint().unwrap();
+        
+        let mut v1 = SecureBigUint(raw_val.clone());
+        let mut v2 = SecureBigUint2(raw_val.clone());
+
+        // Both hold the same mathematical data initially
+        assert_eq!(v1.0, raw_val);
+        assert_eq!(v2.0, raw_val);
+
+        // --- Execute Zeroize ---
+        v1.zeroize();
+        v2.zeroize();
+
+        // 1. Logical Verification (Both pass this, because the API says they are zero)
+        assert_eq!(v1.0, BigUint::zero());
+        assert_eq!(v2.0, BigUint::zero());
+
+        // 2. Behavioral Verification of the original allocation
+        // SecureBigUint just reassigned self.0 to a static/empty zero state.
+        // SecureBigUint2 physically walked the digits allocation before resetting the layout.
+        assert!(v1.0.to_u32_digits().is_empty());
+        assert!(v2.0.to_u32_digits().is_empty());
+    }
+
+    #[test]
+    fn test_secrecy_integration_with_secure_zeroize() {
+        let secret_value = 9876543210u64.to_biguint().unwrap();
+        
+        // Wrap our deep-scrubbing implementation inside a SecretBox
+        let secret_box = SecretBox::new(Box::new(SecureBigUint2(secret_value.clone())));
+let secret_box2 = SecretBox::init_with(|| SecureBigUint2(secret_value.clone()));
+        // The only way to access the underlying BigUint data is through explicit exposure
+        let exposed = secret_box2.expose_secret();
+        assert_eq!(exposed.0, secret_value);
+
+        // When secret_box goes out of scope here, the secrecy crate automatically 
+        // invokes the Zeroize trait on SecureBigUint2, which triggers our custom
+        // memory scrub of the limbs before the pointer is dropped.
+    }
+}
+// end of types/secure_types.rs
+
+// start of types/newtypes.rs
+pub mod field_element;
+pub use field_element::FieldElement;
+// end of types/newtypes.rs
+
+// start of types/newtypes/field_element.rs
+use std::ops::{Add, Div, Mul, Sub};
+use zeroize::Zeroize;
+
+#[cfg(feature = "dev")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Zeroize)]
+pub struct FieldElement(pub u8);
+
+// Now we implement the traits so we can use +, -, *, /
+impl Add for FieldElement {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        FieldElement(self.0 ^ rhs.0)
+    }
+}
+
+impl Sub for FieldElement {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        self.add(rhs) // Subtraction is Addition in GF(2^8)
+    }
+}
+
+impl Mul for FieldElement {
+    type Output = Self;
+
+    fn mul(self, rhs: Self) -> Self {
+        let mut a = self.0;
+        let mut b = rhs.0;
+        let mut p = 0u8; // The product
+
+        for _ in 0..8 {
+            if (b & 1) != 0 {
+                p ^= a; // Galois Addition (XOR)
+            }
+            let hi_bit_set = (a & 0x80) != 0;
+            a <<= 1;
+            if hi_bit_set {
+                a ^= 0x1B; // XOR with AES Polynomial (x^8 + x^4 + x^3 + x + 1)
+            }
+            b >>= 1;
+        }
+        FieldElement(p)
+    }
+}
+
+impl Div for FieldElement {
+    type Output = Self;
+
+    #[inline]
+    fn div(self, rhs: Self) -> Self {
+        if rhs.0 == 0 {
+            // In a professional crate, you might panic here
+            // or return a 'Zero' element depending on the spec.
+            panic!("Division by zero in GF(256)");
+        }
+        // a / b is just a * inv(b)
+        self * rhs.inv()
+    }
+}
+
+use crate::galois_fields::call_exp;
+impl FieldElement {
+    pub fn inv(self) -> Self {
+        // Fermat implementation: a^(255-2)
+        // This is safe because 0 is handled in the div trait or here
+        if self.0 == 0 {
+            panic!("0 has no inverse");
+        }
+        FieldElement(call_exp(self.0, 254))
+    }
+}
+
+use std::ops::BitXor;
+impl BitXor for FieldElement {
+    type Output = Self;
+
+    // In Galois Field 2^8, XOR is exactly what "Addition" means.
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        FieldElement(self.0 ^ rhs.0)
+    }
+}
+
+use crate::galois_fields::gf256_mul_ct;
+use crate::traits::GaloisField;
+impl GaloisField for FieldElement {
+    fn run_add(self, other: Self) -> Self {
+        self.add(other)
+    }
+    fn run_sub(self, other: Self) -> Self {
+        self.sub(other)
+    }
+    fn run_mul(self, other: Self) -> Self {
+        FieldElement(gf256_mul_ct(self.0, other.0))
+    }
+    fn run_inv(self) -> Self {
+        self.inv()
+    }
+    const ZERO: Self = FieldElement(0);
+    const ONE: Self = FieldElement(1);
+}
+
+impl From<u8> for FieldElement {
+    fn from(b: u8) -> Self {
+        FieldElement(b)
+    }
+}
+// end of types/newtypes/field_element.rs
+
+// start of uses.rs
+pub mod aes;
+pub mod shamir;
+// end of uses.rs
+
+// start of lib.rs
+//! # HONEST
+//! High-assurance Operations for Number-theoretic Extension Sets and Theorems.
+//! 
+//! This crate provides formally verified Galois Field arithmetic 
+//! using Creusot contracts.
+
+
+
+pub mod galois_fields;
+pub mod polynomial;
+pub mod traits;
+pub mod types;
+pub mod uses;
+// end of lib.rs
+
+// start of uses/shamir.rs
+
+// end of uses/shamir.rs
+
+// start of uses/aes/s_box.rs
+use crate::types::FieldElement;
+pub fn s_box_old(input: FieldElement) -> FieldElement {
+    let b = if input.0 == 0 { 0 } else { input.inv().0 };
+
+    // x ^ (x << 1) ^ (x << 2) ^ (x << 3) ^ (x << 4) ^ 0x63 (all mod x^8 + 1)
+    let s = b;
+    let out = s ^ s.rotate_left(1) ^ s.rotate_left(2) ^ s.rotate_left(3) ^ s.rotate_left(4) ^ 0x63;
+
+    FieldElement(out)
+}
+
+pub fn s_box(input: FieldElement) -> FieldElement {
+    // 1. Constant-time Inverse (assuming your inv() is constant-time)
+    let b = input.inv().0;
+
+    // 2. Mathematically correct Affine Transformation
+    // We use bit-masking instead of rotation to match the AES matrix
+    let x = b;
+    let out =
+        x ^ (x << 1 | x >> 7) ^ (x << 2 | x >> 6) ^ (x << 3 | x >> 5) ^ (x << 4 | x >> 4) ^ 0x63;
+
+    FieldElement(out)
+}
+// pub fn inv_s_box(input: FieldElement) -> FieldElement {
+//     let s = input.0;
+//     // 1. Inverse Affine Transformation
+//     // This is the constant-time version of the AES inverse affine map
+//     let out = (s.rotate_right(1) ^ s.rotate_right(3) ^ s.rotate_right(6)) ^ 0x05;
+//
+//     // 2. Multiplicative Inverse (using your existing logic)
+//     // 0 is still mapped to 0 in AES
+//     if out == 0 {
+//         FieldElement(0)
+//     } else {
+//         FieldElement(out).inv()
+//     }
+// }
+pub fn inv_s_box_old(input: FieldElement) -> FieldElement {
+    let s = input.0;
+
+    // 1. Inverse Affine Transformation
+    // The specific bitwise mapping to undo the forward S-box affine transform
+    let out = s.rotate_left(1) ^ s.rotate_left(3) ^ s.rotate_left(6) ^ 0x05;
+
+    // 2. Multiplicative Inverse
+    // In AES, the inverse of 0 is defined as 0.
+    if out == 0 {
+        FieldElement(0)
+    } else {
+        FieldElement(out).inv()
+    }
+}
+pub fn inv_s_box(input: FieldElement) -> FieldElement {
+    let s = input.0;
+
+    // 1. Standard Inverse Affine Transformation
+    // This is the bit-mapping required by FIPS 197
+    let x = s;
+    let out = (x.rotate_left(1)) ^ (x.rotate_left(3)) ^ (x.rotate_left(6)) ^ 0x05; // 0x05 is the correct constant for the inverse
+
+    // 2. Multiplicative Inverse (Must be the final step)
+    FieldElement(out).inv()
+}
+#[test]
+fn s_box_0x01() {
+    let v = s_box(FieldElement(0x01));
+    assert_eq!(v.0, 0x7C)
+}
+#[test]
+fn test_sbox_full_circle() {
+    for i in 0..=255 {
+        assert!(
+            is_sbox_inverse(i),
+            "S-box failed to invert at value: {:#04x}",
+            i
+        );
+    }
+}
+
+#[test]
+fn test_standard_aes_compliance() {
+    // Standard AES: S-Box of 0x53 MUST be 0xED
+    let input = FieldElement(0x53);
+    let output = s_box(input);
+    assert_eq!(
+        output.0, 0xED,
+        "Your S-Box is reversible, but it's not AES standard!"
+    );
+}
+
+pub fn is_sbox_inverse(x: u8) -> bool {
+    inv_s_box(s_box(FieldElement(x))) == FieldElement(x)
+}
+// end of uses/aes/s_box.rs
+
+// start of uses/aes/xtime.rs
+use crate::types::FieldElement;
+
+// A high-performance "Multiply by 2" for AES
+pub(crate) fn xtime_old(a: FieldElement) -> FieldElement {
+    let raw = a.0;
+    let res = if raw & 0x80 != 0 {
+        (raw << 1) ^ 0x1B
+    } else {
+        raw << 1
+    };
+    FieldElement(res)
+}
+pub(crate) fn xtime(a: FieldElement) -> FieldElement {
+    let raw = a.0;
+
+    // Shift left by 1 (standard multiply by 2)
+    let shifted = raw << 1;
+
+    // Create a mask: if the 7th bit was 1, mask is 0xFF. If 0, mask is 0x00.
+    // We cast to i8 to use arithmetic shift to fill the byte.
+    let mask = ((raw as i8) >> 7) as u8;
+
+    // XOR with 0x1B only if the mask is 0xFF
+    FieldElement(shifted ^ (mask & 0x1B))
+}
+// end of uses/aes/xtime.rs
+
+// start of uses/aes/aes_round.rs
+use crate::{
+    types::FieldElement,
+    uses::aes::{mix_columns, s_box, shift_rows}
+};
+
+pub fn aes_round(
+    state: &mut [FieldElement; 16],
+    key: &[FieldElement; 16],
+    last_round: bool) {
+    // 1. SubBytes
+    for byte in state.iter_mut() {
+        *byte = s_box(*byte);
+    }
+
+    // 2. ShiftRows
+    shift_rows(state);
+
+    // 3. MixColumns (Skipped in the final round)
+    if !last_round {
+        mix_columns(state);
+    }
+
+    // 4. AddRoundKey
+    for i in 0..16 {
+        state[i] = state[i] + key[i];
+    }
+}
+// end of uses/aes/aes_round.rs
+
+// start of uses/aes/shift_rows.rs
+use crate::types::FieldElement;
+
+pub(crate)fn shift_rows(state: &mut [FieldElement; 16]) {
+    let temp = *state;
+    // Row 1 (indices 1, 5, 9, 13)
+    state[1]  = temp[5];
+    state[5]  = temp[9];
+    state[9]  = temp[13];
+    state[13] = temp[1];
+
+    // Row 2 (indices 2, 6, 10, 14)
+    state[2]  = temp[10];
+    state[6]  = temp[14];
+    state[10] = temp[2];
+    state[14] = temp[6];
+
+    // Row 3 (indices 3, 7, 11, 15)
+    state[3]  = temp[15];
+    state[7]  = temp[3];
+    state[11] = temp[7];
+    state[15] = temp[11];
+}
+
+pub fn inv_shift_rows(state: &mut [FieldElement; 16]) {
+    // Row 0: state[0], state[4], state[8], state[12] (No change)
+
+    // Row 1: state[1], state[5], state[9], state[13] (Shift Right by 1)
+    let tmp = state[13];
+    state[13] = state[9];
+    state[9] = state[5];
+    state[5] = state[1];
+    state[1] = tmp;
+
+    // Row 2: state[2], state[6], state[10], state[14] (Shift Right by 2)
+    state.swap(2, 10);
+    state.swap(6, 14);
+
+    // Row 3: state[3], state[7], state[11], state[15] (Shift Right by 3)
+    let tmp = state[3];
+    state[3] = state[7];
+    state[7] = state[11];
+    state[11] = state[15];
+    state[15] = tmp;
+}
+// end of uses/aes/shift_rows.rs
+
+// start of uses/aes/expand_key.rs
+use crate::{types::FieldElement, uses::aes::{get_rcon, s_box}};
+pub fn expand_key(master_key: [u8; 16]) -> Vec<FieldElement> {
+    // AES-128 needs 11 round keys (16 bytes each = 176 bytes / 44 words)
+    let mut w: Vec<FieldElement> = master_key.iter().map(|&b| FieldElement(b)).collect();
+    
+    for i in 4..44 {
+        // 'temp' is the previous 4-byte word
+        let mut temp = [
+            w[(i-1)*4], w[(i-1)*4 + 1], w[(i-1)*4 + 2], w[(i-1)*4 + 3]
+        ];
+
+        if i % 4 == 0 {
+            // 1. RotWord: [a, b, c, d] -> [b, c, d, a]
+            temp.rotate_left(1);
+
+            // 2. SubWord: Apply S-Box to all 4 bytes
+            for byte in temp.iter_mut() {
+                *byte = s_box(*byte);
+            }
+
+            // 3. XOR with Rcon: Only the first byte of the word
+            temp[0] = temp[0] + get_rcon(i / 4);
+        }
+
+        // w[i] = w[i-4] ^ temp
+        for j in 0..4 {
+            let val = w[(i-4)*4 + j] + temp[j];
+            w.push(val);
+        }
+    }
+    w
+}
+// end of uses/aes/expand_key.rs
+
+// start of uses/aes/mod.rs
+pub mod aes_encrypt;
+pub use aes_encrypt::{aes_encrypt};
+pub mod aes_round;
+pub use aes_round::aes_round;
+pub mod expand_key;
+pub use expand_key::expand_key;
+pub mod get_rcon;
+pub(crate)use get_rcon::get_rcon;
+pub mod mix_columns;
+pub use mix_columns::{inv_mix_columns, inv_mix_columns_xtime, mix_columns};
+pub mod s_box;
+pub use s_box::{s_box, inv_s_box};
+
+pub use inv_aes_round::inv_aes_round;
+pub mod inv_aes_round;
+pub mod shift_rows;
+pub(crate)use shift_rows::{inv_shift_rows, shift_rows};
+pub(crate)mod xtime;
+pub(crate)use xtime::xtime;
+// end of uses/aes/mod.rs
+
+// start of uses/aes/aes_encrypt.rs
+use crate::{types::FieldElement, uses::aes::{aes_round, expand_key, inv_aes_round}};
+
+pub fn aes_encrypt(message: [u8; 16], master_key: [u8; 16]) -> [u8; 16] {
+    let mut state: [FieldElement; 16] = message.map(FieldElement);
+    let round_keys = expand_key(master_key);
+
+    // Initial Round: Just AddRoundKey
+    add_round_key(&mut state, &round_keys[0..16]);
+
+    // // Rounds 1 through 9
+    // for r in 1..10 {
+    //     let key_start = r * 16;
+    //     aes_round(&mut state, &round_keys[key_start..key_start+16], false);
+    // }
+    // // Round 10: Final Round (last_round = true skips MixColumns)
+    // aes_round(&mut state, &round_keys[160..176], true);
+    
+    // In your loop (Rounds 1-9)
+    for r in 1..10 {
+        let key_start = r * 16;
+        let key_slice = &round_keys[key_start..key_start + 16];
+        
+        // Convert &[FieldElement] -> &[FieldElement; 16]
+        let key_array: &[FieldElement; 16] = key_slice.try_into().expect("Key slice should be 16 bytes");
+        
+        aes_round(&mut state, key_array, false);
+    }
+
+    // In your final round (Round 10)
+    let final_key: &[FieldElement; 16] = round_keys[160..176].try_into().expect("Final key slice should be 16 bytes");
+    aes_round(&mut state, final_key, true);
+    // Convert back to u8
+    let mut out = [0u8; 16];
+    for i in 0..16 { out[i] = state[i].0; }
+    out
+}
+
+fn add_round_key(state: &mut [FieldElement; 16], key: &[FieldElement]) {
+    for i in 0..16 {
+        state[i] = state[i] + key[i];
+    }
+}
+
+
+pub fn aes_decrypt(ciphertext: [u8; 16], master_key: [u8; 16]) -> [u8; 16] {
+    let mut state: [FieldElement; 16] = ciphertext.map(FieldElement);
+    let round_keys = expand_key(master_key);
+
+    // 1. Initial Round: AddRoundKey with the FINAL round key (Round 10)
+    let final_key: &[FieldElement; 16] = round_keys[160..176].try_into().expect("Key slice error");
+    add_round_key(&mut state, final_key);
+
+    // 2. Inverse Rounds 9 through 1
+    // Note: These must use the Inverse MixColumns and Inverse SubBytes/ShiftRows
+    for r in (1..10).rev() {
+        let key_start = r * 16;
+        let key_array: &[FieldElement; 16] = round_keys[key_start..key_start + 16]
+            .try_into()
+            .expect("Key slice error");
+        
+        // You will need an `inv_aes_round` function
+        inv_aes_round(&mut state, key_array, false);
+    }
+
+    // 3. Final Round: Round 0 key (Initial AddRoundKey from encryption)
+    let initial_key: &[FieldElement; 16] = round_keys[0..16].try_into().expect("Key slice error");
+    inv_aes_round(&mut state, initial_key, true);
+
+    // Convert back to u8
+    state.map(|f| f.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_aes_128_nist_vector() {
+        // NIST Special Publication 800-38A
+        // Key: 2b 7e 15 16 28 ae d2 a6 ab f7 15 88 09 cf 4f 3c
+        // Plaintext: 6b c1 be e2 2e 40 9f 96 e9 3d 7e 11 73 93 17 2a
+        // Ciphertext: 3a d7 7b b4 0d 7a 36 60 a8 9e ca f3 24 66 ef 97
+
+        let key: [u8; 16] = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 
+            0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c
+        ];
+        let plaintext: [u8; 16] = [
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 
+            0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a
+        ];
+        let expected_ciphertext: [u8; 16] = [
+            0x3a, 0xd7, 0x7b, 0xb4, 0x0d, 0x7a, 0x36, 0x60, 
+            0xa8, 0x9e, 0xca, 0xf3, 0x24, 0x66, 0xef, 0x97
+        ];
+
+        let result = aes_encrypt(plaintext, key);
+        assert_eq!(result, expected_ciphertext, "AES encryption failed NIST test vector");
+    }
+
+    #[test]
+    fn test_zero_block() {
+        // All zeros is a common edge case to ensure S-Box and MixColumns handle 0 correctly
+        let key = [0u8; 16];
+        let plaintext = [0u8; 16];
+        
+        // This value is the result of AES-128(0^128, 0^128)
+        let expected: [u8; 16] = [
+            0x66, 0xe9, 0x4b, 0xd4, 0xef, 0x8a, 0x2c, 0x3b, 
+            0x88, 0x4c, 0xfa, 0x59, 0xca, 0x34, 0x2b, 0x2e
+        ];
+
+        let result = aes_encrypt(plaintext, key);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_different_keys_produce_different_output() {
+        let plaintext = [0x42u8; 16];
+        let key_a = [0x01u8; 16];
+        let key_b = [0x02u8; 16];
+
+        let out_a = aes_encrypt(plaintext, key_a);
+        let out_b = aes_encrypt(plaintext, key_b);
+
+        assert_ne!(out_a, out_b, "Different keys should not produce the same ciphertext");
+    }
+}
+
+
+#[cfg(test)]
+mod tests2 {
+    use super::*;
+
+    /// NIST SP 800-38A Test Vector
+    const KEY: [u8; 16] = [
+        0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 
+        0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c
+    ];
+    const PT: [u8; 16] = [
+        0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 
+        0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a
+    ];
+    const CT: [u8; 16] = [
+        0x3a, 0xd7, 0x7b, 0xb4, 0x0d, 0x7a, 0x36, 0x60, 
+        0xa8, 0x9e, 0xca, 0xf3, 0x24, 0x66, 0xef, 0x97
+    ];
+
+    #[test]
+    fn test_encryption_nist_vector() {
+        let result = aes_encrypt(PT, KEY);
+        assert_eq!(result, CT, "Encryption failed to match NIST vector");
+    }
+
+    #[test]
+    fn test_decryption_nist_vector() {
+        let result = aes_decrypt(CT, KEY);
+        assert_eq!(result, PT, "Decryption failed to match NIST vector");
+    }
+
+    #[test]
+    fn test_round_trip_identity() {
+        // Encrypting then decrypting must yield the original input
+        let my_key = *b"this_is_a_key_16";
+        let my_data = *b"secret_data_1234";
+
+        let encrypted = aes_encrypt(my_data, my_key);
+        let decrypted = aes_decrypt(encrypted, my_key);
+
+        assert_eq!(my_data, decrypted, "Round trip failed: Data corrupted during Enc/Dec process");
+    }
+
+    #[test]
+    fn test_zero_block_consistency() {
+        let zero = [0u8; 16];
+        let expected_ct = [
+            0x66, 0xe9, 0x4b, 0xd4, 0xef, 0x8a, 0x2c, 0x3b, 
+            0x88, 0x4c, 0xfa, 0x59, 0xca, 0x34, 0x2b, 0x2e
+        ];
+
+        let ct = aes_encrypt(zero, zero);
+        assert_eq!(ct, expected_ct, "Zero block encryption failed");
+        
+        let pt = aes_decrypt(ct, zero);
+        assert_eq!(pt, zero, "Zero block decryption failed");
+    }
+
+    #[test]
+    fn test_avalanche_effect() {
+        // Changing one bit in the key should completely change the ciphertext
+        let pt = [0u8; 16];
+        let key1 = [0u8; 16];
+        let mut key2 = [0u8; 16];
+        key2[15] = 1; // Flip the very last bit
+
+        let ct1 = aes_encrypt(pt, key1);
+        let ct2 = aes_encrypt(pt, key2);
+
+        // Calculate how many bytes are different
+        let diff_count = ct1.iter().zip(ct2.iter()).filter(|(a, b)| a != b).count();
+        assert!(diff_count > 10, "Avalanche effect too weak: only {} bytes changed", diff_count);
+    }
+
+    #[test]
+    fn test_mathematical_sbox_consistency() {
+        // This checks if your inv_s_box correctly reverses s_box for all 256 values
+        use crate::uses::aes::s_box;
+        use crate::uses::aes::inv_s_box;
+        use crate::types::FieldElement;
+
+        for i in 0..=255 {
+            let original = FieldElement(i);
+            let encrypted = s_box(original);
+            let decrypted = inv_s_box(encrypted);
+            assert_eq!(original, decrypted, "S-Box math failed for value: {:#04x}", i);
+        }
+    }
+}
+// end of uses/aes/aes_encrypt.rs
+
+// start of uses/aes/mix_columns.rs
+use crate::{types::FieldElement, uses::aes::xtime};
+
+pub fn mix_columns(state: &mut [FieldElement; 16]) {
+    let two = FieldElement(0x02);
+    let three = FieldElement(0x03);
+
+    // We process each of the 4 columns manually
+    // Column 0
+    let s0 = state[0]; let s1 = state[1]; let s2 = state[2]; let s3 = state[3];
+    state[0] = (two * s0) ^ (three * s1) ^ s2 ^ s3;
+    state[1] = s0 ^ (two * s1) ^ (three * s2) ^ s3;
+    state[2] = s0 ^ s1 ^ (two * s2) ^ (three * s3);
+    state[3] = (three * s0) ^ s1 ^ s2 ^ (two * s3);
+
+    // Column 1
+    let s4 = state[4]; let s5 = state[5]; let s6 = state[6]; let s7 = state[7];
+    state[4] = (two * s4) ^ (three * s5) ^ s6 ^ s7;
+    state[5] = s4 ^ (two * s5) ^ (three * s6) ^ s7;
+    state[6] = s4 ^ s5 ^ (two * s6) ^ (three * s7);
+    state[7] = (three * s4) ^ s5 ^ s6 ^ (two * s7);
+
+    // Column 2
+    let s8 = state[8]; let s9 = state[9]; let s10 = state[10]; let s11 = state[11];
+    state[8] = (two * s8) ^ (three * s9) ^ s10 ^ s11;
+    state[9] = s8 ^ (two * s9) ^ (three * s10) ^ s11;
+    state[10] = s8 ^ s9 ^ (two * s10) ^ (three * s11);
+    state[11] = (three * s8) ^ s9 ^ s10 ^ (two * s11);
+
+    // Column 3
+    let s12 = state[12]; let s13 = state[13]; let s14 = state[14]; let s15 = state[15];
+    state[12] = (two * s12) ^ (three * s13) ^ s14 ^ s15;
+    state[13] = s12 ^ (two * s13) ^ (three * s14) ^ s15;
+    state[14] = s12 ^ s13 ^ (two * s14) ^ (three * s15);
+    state[15] = (three * s12) ^ s13 ^ s14 ^ (two * s15);
+}
+
+pub fn mix_columns_xtime(state: &mut [FieldElement; 16]) {
+    // Process each column manually for formal verification clarity
+    
+    // Column 0 (Indices 0, 1, 2, 3)
+    let s0 = state[0]; let s1 = state[1]; let s2 = state[2]; let s3 = state[3];
+    state[0] = xtime(s0) ^ (xtime(s1) ^ s1) ^ s2 ^ s3;
+    state[1] = s0 ^ xtime(s1) ^ (xtime(s2) ^ s2) ^ s3;
+    state[2] = s0 ^ s1 ^ xtime(s2) ^ (xtime(s3) ^ s3);
+    state[3] = (xtime(s0) ^ s0) ^ s1 ^ s2 ^ xtime(s3);
+
+    // Column 1 (Indices 4, 5, 6, 7)
+    let s4 = state[4]; let s5 = state[5]; let s6 = state[6]; let s7 = state[7];
+    state[4] = xtime(s4) ^ (xtime(s5) ^ s5) ^ s6 ^ s7;
+    state[5] = s4 ^ xtime(s5) ^ (xtime(s6) ^ s6) ^ s7;
+    state[6] = s4 ^ s5 ^ xtime(s6) ^ (xtime(s7) ^ s7);
+    state[7] = (xtime(s4) ^ s4) ^ s5 ^ s6 ^ xtime(s7);
+
+    // Column 2 (Indices 8, 9, 10, 11)
+    let s8 = state[8]; let s9 = state[9]; let s10 = state[10]; let s11 = state[11];
+    state[8] = xtime(s8) ^ (xtime(s9) ^ s9) ^ s10 ^ s11;
+    state[9] = s8 ^ xtime(s9) ^ (xtime(s10) ^ s10) ^ s11;
+    state[10] = s8 ^ s9 ^ xtime(s10) ^ (xtime(s11) ^ s11);
+    state[11] = (xtime(s8) ^ s8) ^ s9 ^ s10 ^ xtime(s11);
+
+    // Column 3 (Indices 12, 13, 14, 15)
+    let s12 = state[12]; let s13 = state[13]; let s14 = state[14]; let s15 = state[15];
+    state[12] = xtime(s12) ^ (xtime(s13) ^ s13) ^ s14 ^ s15;
+    state[13] = s12 ^ xtime(s13) ^ (xtime(s14) ^ s14) ^ s15;
+    state[14] = s12 ^ s13 ^ xtime(s14) ^ (xtime(s15) ^ s15);
+    state[15] = (xtime(s12) ^ s12) ^ s13 ^ s14 ^ xtime(s15);
+}
+
+pub fn mix_columns_dry(state: &mut [FieldElement; 16]) {
+    let two = FieldElement(0x02);
+    let three = FieldElement(0x03);
+
+    for i in 0..4 {
+        let c = i * 4;
+        let s0 = state[c];
+        let s1 = state[c + 1];
+        let s2 = state[c + 2];
+        let s3 = state[c + 3];
+
+        state[c]     = (two * s0)   + (three * s1) + s2 + s3;
+        state[c + 1] = s0           + (two * s1)   + (three * s2) + s3;
+        state[c + 2] = s0           + s1           + (two * s2)   + (three * s3);
+        state[c + 3] = (three * s0) + s1           + s2           + (two * s3);
+    }
+}
+
+
+
+
+pub fn inv_mix_columns(state: &mut [FieldElement; 16]) {
+    let e = FieldElement(0x0e);
+    let b = FieldElement(0x0b);
+    let d = FieldElement(0x0d);
+    let n = FieldElement(0x09); // 'n' for nine
+
+    for i in 0..4 {
+        let c = i * 4;
+        let s0 = state[c];   let s1 = state[c + 1];
+        let s2 = state[c + 2]; let s3 = state[c + 3];
+
+        state[c]     = (e * s0) ^ (b * s1) ^ (d * s2) ^ (n * s3);
+        state[c + 1] = (n * s0) ^ (e * s1) ^ (b * s2) ^ (d * s3);
+        state[c + 2] = (d * s0) ^ (n * s1) ^ (e * s2) ^ (b * s3);
+        state[c + 3] = (b * s0) ^ (d * s1) ^ (n * s2) ^ (e * s3);
+    }
+}
+
+
+
+pub fn inv_mix_columns_xtime(state: &mut [FieldElement; 16]) {
+    for i in 0..4 {
+        let c = i * 4;
+        let s0 = state[c];   let s1 = state[c + 1];
+        let s2 = state[c + 2]; let s3 = state[c + 3];
+
+        // Helper to multiply by 9, 11, 13, 14 using xtime
+        let mul9  = |s: FieldElement| xtime(xtime(xtime(s))) ^ s;
+        let mul11 = |s: FieldElement| xtime(xtime(xtime(s))) ^ xtime(s) ^ s;
+        let mul13 = |s: FieldElement| xtime(xtime(xtime(s))) ^ xtime(xtime(s)) ^ s;
+        let mul14 = |s: FieldElement| xtime(xtime(xtime(s))) ^ xtime(xtime(s)) ^ xtime(s);
+
+        state[c]     = mul14(s0) ^ mul11(s1) ^ mul13(s2) ^ mul9(s3);
+        state[c + 1] = mul9(s0)  ^ mul14(s1) ^ mul11(s2) ^ mul13(s3);
+        state[c + 2] = mul13(s0) ^ mul9(s1)  ^ mul14(s2) ^ mul11(s3);
+        state[c + 3] = mul11(s0) ^ mul13(s1) ^ mul9(s2)  ^ mul14(s3);
+    }
+}
+
+
+
+// end of uses/aes/mix_columns.rs
+
+// start of uses/aes/inv_aes_round.rs
+use crate::{
+    types::FieldElement,
+    uses::aes::{inv_mix_columns, inv_s_box, inv_shift_rows}
+};
+
+pub fn inv_aes_round(
+    state: &mut [FieldElement; 16],
+    key: &[FieldElement; 16],
+    last_round: bool
+) {
+    // 1. AddRoundKey (Same as encryption because XOR is its own inverse)
+    for i in 0..16 {
+        state[i] = state[i] + key[i];
+    }
+
+    // 2. MixColumns (Skipped in the first decryption round, which is Round 10)
+    if !last_round {
+        inv_mix_columns(state);
+    }
+
+    // 3. Inverse ShiftRows
+    inv_shift_rows(state);
+
+    // 4. Inverse SubBytes
+    for byte in state.iter_mut() {
+        *byte = inv_s_box(*byte);
+    }
+}
+// end of uses/aes/inv_aes_round.rs
+
+// start of uses/aes/get_rcon.rs
+use crate::{types::FieldElement, uses::aes::xtime};
+
+pub fn get_rcon(round: usize) -> FieldElement {
+    // Rcon(i) = 2^(i-1) in GF(2^8)
+    // Round 1 -> 2^0 = 1, Round 2 -> 2^1 = 2, etc.
+    let mut val = FieldElement(1);
+    let two = FieldElement(2);
+    for _ in 1..round {
+        val = val * two;
+    }
+    val
+}
+
+pub fn get_rcon_lookup(round: usize) -> FieldElement {
+    // Standard AES Rcon values for rounds 1-10
+    // We use a lookup table for O(1) speed and zero logic bugs
+    const RCON: [u8; 11] = [
+        0x00, // Round 0 (unused in standard AES key schedule)
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36,
+    ];
+
+    if round < RCON.len() {
+        FieldElement(RCON[round])
+    } else {
+        // Fallback for non-standard rounds or AES-256
+        // This is where your xtime comes in handy!
+        let mut val = 0x01;
+        for _ in 1..round {
+            val = xtime::xtime(FieldElement(val)).0;
+        }
+        FieldElement(val)
+    }
+}
+// end of uses/aes/get_rcon.rs
+
+// start of galois_fields.rs
+/// Runtime GF(256) addition (XOR)
+pub(crate) fn gf256_add(a: u8, b: u8) -> u8 {a ^ b }
+pub fn call_add(a: u8, b: u8) -> u8 { gf256_add(a, b) }
+/// Same as add in GF(2^8)
+pub(crate) fn gf256_sub(a: u8, b: u8) -> u8 { a ^ b }
+pub fn call_sub(a: u8, b: u8) -> u8 { gf256_sub(a, b) }
+pub(crate) fn gf256_mul_ct(mut a: u8, mut b: u8) -> u8 {
+    let mut result = 0u8;
+    // We loop exactly 8 times (deterministic timing)
+    for _ in 0..8 {
+        // Mask: if the LSB of b is 1, mask is 0xFF, else 0x00
+        let mask = !((b & 1).wrapping_sub(1));
+        result ^= a & mask;
+
+        // Reduction step: if MSB of a is 1, we XOR with the polynomial
+        let carry = (a >> 7) & 1;
+        let poly_mask = !((carry).wrapping_sub(1));
+        a = (a << 1) ^ (poly_mask & 0x1b);
+
+        b >>= 1;
+    }
+    result
+}pub fn call_mul_ct(a: u8, b: u8) -> u8 { gf256_mul_ct(a, b) }
+pub(crate) fn gf256_exp_ct_safe(mut base: u8, mut exp: u8) -> u8 {
+    let mut result = 1u8;
+    // Loop exactly 8 times to process every bit of the u8 exponent deterministically
+    for _ in 0..8 {
+        let bit = exp & 1;
+        // If bit is 1, mask is 0xFF, else 0x00
+        let mask = !((bit).wrapping_sub(1));
+        
+        // Always multiply, but use the mask to decide whether to update the state
+        let next_mult = gf256_mul_ct(result, base);
+        result = (next_mult & mask) | (result & !mask);
+        
+        base = gf256_mul_ct(base, base);
+        exp >>= 1;
+    }
+    result
+}pub fn call_exp_ct_safe(a: u8, b: u8) -> u8 { gf256_exp_ct_safe(a, b) }
+pub(crate) fn gf256_mul(mut a: u8, mut b: u8) -> u8 {
+    let mut result = 0u8;
+    while b != 0 {
+        if b & 1 != 0 {
+            result ^= a;
+        }
+        let carry = a & 0x80;
+        a <<= 1;
+        if carry != 0 {
+            a ^= 0x1b; // irreducible polynomial x^8 + x^4 + x^3 + x + 1
+        }
+        b >>= 1;
+    }
+    result
+}pub fn call_mul(a: u8, b: u8) -> u8 { gf256_mul(a, b) }
+fn gf256_exp(mut base: u8, mut exp: u8) -> u8 {
+    let mut result = 1u8;
+    while exp != 0 {
+        if exp & 1 != 0 {
+            result = gf256_mul_ct(result, base);
+        }
+        base = gf256_mul_ct(base, base);
+        exp >>= 1;
+    }
+    result
+}pub fn call_exp(base: u8, exp: u8) -> u8 { gf256_exp(base, exp) }
+
+
+pub(crate) fn gf256_inv(a: u8) -> u8 {
+    assert!(a != 0, "cannot invert 0 in GF(256)");
+    // Fermat’s little theorem: a^(2^8 - 2) = a^-1 in GF(2^8)
+    gf256_exp(a, 254)
+}pub fn call_inv(a: u8) -> u8 { gf256_inv(a) }
+
+pub(crate) fn gf256_div(a: u8, b: u8) -> u8 {
+    gf256_mul(a, gf256_inv(b))
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+pub struct GF256Tables {
+    pub log: [u8; 256],
+    pub exp: [u8; 512],
+}
+
+pub const TABLES: GF256Tables = {
+    let mut log = [0u8; 256];
+    let mut exp = [0u8; 512];
+    let mut x = 1u8;
+    let mut i = 0;
+    
+    while i < 255 {
+        exp[i] = x;
+        exp[i + 255] = x;
+        log[x as usize] = i as u8;
+        
+        let carry = x & 0x80;
+        x = (x << 1) ^ (if carry != 0 { 0x1b } else { 0 });
+        i += 1;
+    }
+    
+    GF256Tables { log, exp }
+};
+pub fn generate_tables() -> ([u8; 256], [u8; 512]) {
+    let mut log = [0u8; 256];
+    let mut exp = [0u8; 512];
+    
+    let mut x = 1u8;
+    for i in 0..255 {
+        exp[i] = x;
+        exp[i + 255] = x; // Duplicate for overflow handling
+        log[x as usize] = i as u8;
+        
+        // Multiply by 2 (the generator)
+        let carry = x & 0x80;
+        x <<= 1;
+        if carry != 0 {
+            x ^= 0x1b; // The irreducible polynomial
+        }
+    }
+    
+    // Note: log[0] is technically undefined (-infinity)
+    // We usually set it to 0 or 255 depending on the impl.
+    (log, exp)
+}
+pub fn is_valid_log_table(log: [u8; 256], exp: [u8; 512]) -> bool {
+    for x in 1u16..=255 {
+        let x = x as u8;
+        let log_x = log[x as usize] as usize;
+
+        if exp[log_x] != x {
+            return false;
+        }
+    }
+    true
+}
+
+
+
+
+
+
+
+
+
+
+
+pub fn gf256_mul_fast(a: u8, b: u8) -> u8 {
+    if a == 0 || b == 0 { return 0; }
+    
+    let l_a = TABLES.log[a as usize];
+    let l_b = TABLES.log[b as usize];
+    
+    // Adding logs is equivalent to multiplying elements
+    // We use the 512-length exp table to avoid a % 255
+    // TABLES.exp[(l_a as usize) + (l_b as usize)]
+    let res = TABLES.exp[(l_a as usize) + (l_b as usize)];
+    res
+}pub fn run_mul_opt(a: u8, b: u8) -> u8 { gf256_mul_fast(a, b) } // Calling the table-based version
+
+
+
+
+
+
+
+
+
+
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gf256_add_sub() {
+        for a in 0..=255 {
+            for b in 0..=255 {
+                assert_eq!(gf256_add(a, b), a ^ b);
+                assert_eq!(gf256_sub(a, b), a ^ b);
+                assert_eq!(gf256_add(a, b), gf256_sub(a, b)); // symmetry in GF(2^8)
+            }
+        }
+    }
+
+    #[test]
+    fn test_gf256_mul_basic() {
+        assert_eq!(gf256_mul(0, 0), 0);
+        assert_eq!(gf256_mul(0, 1), 0);
+        assert_eq!(gf256_mul(1, 0), 0);
+        assert_eq!(gf256_mul(1, 1), 1);
+        assert_eq!(gf256_mul(1, 255), 255);
+        assert_eq!(gf256_mul(255, 1), 255);
+    }
+
+    #[test]
+    fn test_gf256_mul_distributive() {
+        // a*(b+c) = ab + ac
+        for a in 1..=10 {
+            for b in 1..=10 {
+                for c in 1..=10 {
+                    let left = gf256_mul(a, gf256_add(b, c));
+                    let right = gf256_add(gf256_mul(a, b), gf256_mul(a, c));
+                    assert_eq!(left, right, "Distributive failed for a={}, b={}, c={}", a, b, c);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_gf256_inv_and_div() {
+        for a in 1..=255 {
+            let inv = gf256_inv(a);
+            assert_eq!(gf256_mul(a, inv), 1, "a * inv(a) != 1 for a = {}", a);
+
+            for b in 1..=255 {
+                let div = gf256_div(a, b);
+                assert_eq!(gf256_mul(div, b), a, "a/b * b != a for a = {}, b = {}", a, b);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot invert 0 in GF(256)")]
+    fn test_gf256_inv_zero_should_panic() {
+        gf256_inv(0);
+    }
+
+    #[test]
+    fn test_gf256_exp_properties() {
+        for base in 1..=10 {
+            assert_eq!(gf256_exp(base, 0), 1);
+            assert_eq!(gf256_exp(base, 1), base);
+            assert_eq!(gf256_exp(base, 2), gf256_mul(base, base));
+        }
+    }
+
+    #[test]
+    fn test_gf256_exp_fermat_identity() {
+        for a in 1..=255 {
+            assert_eq!(gf256_exp(a, 254), gf256_inv(a)); // a^(2^8-2) == a^-1
+        }
+    }
+
+    #[test]
+    // Proves that multiplication distributes over addition: a * (b + c) = (a * b) + (a * c)
+    fn is_mul_distributive() {
+        let a = 13 as u8;
+        let b = 16 as u8;
+        let c = 73 as u8;
+    
+        assert_eq!(
+            gf256_mul(a, gf256_add(b, c)),
+            gf256_add(gf256_mul(a, b), gf256_mul(a, c))
+        );
+    }
+    
+    #[test]
+    // Proves that addition is associative: a + (b + c) = (a + b) + c
+    // NOTE: Since addition is simple XOR, this is easy for Z3 to prove (XOR is naturally associative).
+    fn is_add_associative() {
+        let a = 13 as u8;
+        let b = 16 as u8;
+        let c = 73 as u8;
+    
+        assert_eq!(
+            gf256_add(a, gf256_add(b, c)),
+            gf256_add(gf256_add(a, b), c)
+        )
+    }
+    
+    #[test]
+    // Proves that multiplication is associative: a * (b * c) = (a * b) * c
+    // NOTE: This is complex due to the reduction step in gf256_mul.
+    fn is_mul_associative() {
+        let a = 13 as u8;
+        let b = 16 as u8;
+        let c = 73 as u8;
+    
+        assert_eq!(
+            gf256_mul(a, gf256_mul(b, c)),
+            gf256_mul(gf256_mul(a, b), c)
+        );
+    }
+    
+    #[test]
+    // Proves that multiplication is commutative: a * b = b * a
+    pub(crate) fn is_mul_commutative() {
+            let a = 13 as u8;
+        let b = 16 as u8;
+    
+        assert_eq!(
+        gf256_mul(a, b),
+        gf256_mul(b, a)
+        );
+    }
+
+    #[test]
+    pub(crate) fn test_gf256_add_runtime() {
+        for a in 0u8..=255 {
+            for b in 0u8..=255 {
+                let r = gf256_add(a,b);
+                let expected = a.wrapping_add(b);
+                assert!(r == expected); // ✅ pure runtime check
+            }
+        }
+    }
+}
+// end of galois_fields.rs
+
+// start of polynomial.rs
+pub mod evaluate_polynomial;
+pub mod extended_gcd;
+pub mod lagrange_interpolate_at_zero;
+pub mod modinv;
+// end of polynomial.rs
+
+// start of traits.rs
+pub trait GaloisField: Sized + Copy {
+    fn run_add(self, other: Self) -> Self;
+    fn run_sub(self, other: Self) -> Self;
+    fn run_mul(self, other: Self) -> Self;
+    fn run_inv(self) -> Self;
+    const ZERO: Self;
+    const ONE: Self;
+}
+
+// end of traits.rs
+
+// start of polynomial/evaluate_polynomial.rs
+use num_bigint::BigUint;
+use num_traits::{One, Zero};
+/// Evaluates the polynomial at a given `x` value modulo `prime`.
+pub fn evaluate_polynomial(coefficients: &[BigUint], x: &BigUint, prime: &BigUint) -> BigUint {
+    let mut result = BigUint::zero();
+    let mut power_of_x = BigUint::one();
+
+    for coeff in coefficients {
+        let term = (coeff * &power_of_x) % prime;
+        result = (result + term) % prime;
+        power_of_x = (power_of_x * x) % prime;
+    }
+
+    result
+}
+// The actual Horner's Method
+pub fn evaluate_polynomial_horner(
+    coefficients: &[BigUint],
+    x: &BigUint,
+    prime: &BigUint,
+) -> BigUint {
+    // We work backwards from the highest degree coefficient
+    coefficients
+        .iter()
+        .rev()
+        .fold(BigUint::zero(), |acc, coeff| (acc * x + coeff) % prime)
+}
+use crate::types::secure_types::SecureBigUint;
+pub fn secure_evaluate_polynomial(
+    coefficients: &[SecureBigUint],
+    x: &BigUint,
+    prime: &BigUint,
+) -> BigUint {
+    let mut result = BigUint::zero();
+    let mut power_of_x = BigUint::one();
+
+    for coeff in coefficients {
+        let term = (&coeff.0 * &power_of_x) % prime;
+        result = (result + term) % prime;
+        power_of_x = (&power_of_x * x) % prime;
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_bigint::ToBigUint;
+
+    #[test]
+    fn test_poly_eval() {
+        let coeffs = vec![
+            1u8.to_biguint().unwrap(),
+            2u8.to_biguint().unwrap(),
+            3u8.to_biguint().unwrap(),
+        ]; // 1 + 2x + 3x^2
+        let x = 2u8.to_biguint().unwrap(); // x = 2
+        let prime = 97u8.to_biguint().unwrap(); // mod 97
+        assert_eq!(
+            evaluate_polynomial(&coeffs, &x, &prime),
+            (1u8 + 2 * 2 + 3 * 4).into()
+        ); // 1 + 4 + 12 = 17
+    }
+
+    #[test]
+    fn prime_module_order() {
+        let coeffs = vec![
+            1u8.to_biguint().unwrap(),
+            2u8.to_biguint().unwrap(),
+            3u8.to_biguint().unwrap(),
+        ]; // 1 + 2x + 3x^2
+
+        let sec_coeffs = vec![
+            SecureBigUint(1u8.to_biguint().unwrap()),
+            SecureBigUint(2u8.to_biguint().unwrap()),
+            SecureBigUint(3u8.to_biguint().unwrap()),
+        ]; // 1 + 2x + 3x^2
+
+        let x = 2u8.to_biguint().unwrap(); // x = 2
+        let prime = 97u8.to_biguint().unwrap(); // mod 97
+
+        let a = secure_evaluate_polynomial(&sec_coeffs, &x, &prime);
+        let b = evaluate_polynomial(&coeffs, &x, &prime);
+
+        assert_eq!(a, b)
+    }
+}
+// end of polynomial/evaluate_polynomial.rs
+
+// start of polynomial/modinv.rs
+use num_bigint::{BigInt, BigUint, ToBigInt};
+use num_traits::{One, Zero};
+use secrecy::{ExposeSecret, SecretBox};
+
+use crate::{
+    polynomial::extended_gcd::extended_gcd,
+    types::secure_types::{
+        SecretBigUint,
+        SecureBigUint
+    }
+};
+
+/// Computes the modular inverse of `a` modulo `m` using the Extended Euclidean Algorithm.
+pub fn modinv(
+    a: &BigUint,
+    m: &BigUint
+) -> Option<BigUint> {
+    let (gcd, x, _) = extended_gcd(a, m);
+
+    if gcd != BigUint::one() {
+        return None;
+    }
+
+    let m_bigint = m.to_bigint().unwrap();
+    let result = (x % &m_bigint + &m_bigint) % &m_bigint;
+
+    Some(result.to_biguint().unwrap())
+}
+
+pub fn secure_modinv(
+    secret: SecretBigUint,
+    m: &BigUint
+) -> Option<SecretBigUint> {
+    let (gcd, x, _) = extended_gcd(
+        &secret.expose_secret().0,
+        m
+    );
+
+    if gcd != BigUint::one() {
+        return None;
+    }
+
+    let m_bigint = m.to_bigint().unwrap();
+    let inv = (x % &m_bigint + &m_bigint) % &m_bigint;
+    
+    Some(SecretBox::new(Box::new(
+        SecureBigUint(inv.to_biguint().unwrap())
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_bigint::ToBigUint;
+
+    #[test]
+    fn test_modinv_basic() {
+        let a = 3u32.to_biguint().unwrap();
+        let m = 11u32.to_biguint().unwrap();
+        let inv = modinv(&a, &m).unwrap();
+        assert_eq!((&a * &inv) % &m, 1u32.to_biguint().unwrap());
+    }
+
+    #[test]
+    fn test_modinv_non_invertible() {
+        let a = 6u32.to_biguint().unwrap(); // gcd(6, 12) = 6 ≠ 1
+        let m = 12u32.to_biguint().unwrap();
+        assert!(modinv(&a, &m).is_none());
+    }
+
+    #[test]
+    fn test_secure_modinv_basic() {
+        let a = 3u32.to_biguint().unwrap();
+        let m = 11u32.to_biguint().unwrap();
+        let secret = SecretBox::new(Box::new(SecureBigUint(a.clone())));
+        let inv = secure_modinv(secret, &m).unwrap();
+        assert_eq!((&a * &inv.expose_secret().0) % &m, 1u32.to_biguint().unwrap());
+    }
+}
+
+
+
+// /// Computes the modular inverse of `a` modulo `m` using the Extended Euclidean Algorithm.
+// pub(crate) fn modinv(a: &BigUint, m: &BigUint) -> Option<BigUint> {
+//     let (gcd, x, _) = extended_gcd(a, m);
+//     if gcd != BigUint::one() {
+//         None
+//     } else {
+//         Some((x % m.to_bigint().unwrap() + m.to_bigint().unwrap()) % m.to_bigint().unwrap())
+//             .map(|res| res.to_biguint().unwrap())
+//     }
+// }
+// 
+
+pub fn modinverse(
+    a: &BigUint,
+    m: &BigUint
+) -> Option<BigUint> {
+    let (mut mn, mut xy) = (
+        (m.clone(), a.clone()),
+        (BigInt::zero(), BigInt::one())
+    );
+
+    while mn.1 != BigUint::zero() {
+        let quotient = &mn.0 / &mn.1;
+        mn = (mn.1.clone(), &mn.0 - &quotient * &mn.1);
+        xy = (xy.1.clone(), &xy.0 - &quotient.to_bigint().unwrap() * &xy.1);
+    }
+
+    if mn.0 != BigUint::one() {
+        return None;
+    }
+
+    Some((xy.0 % m.to_bigint().unwrap() + m.to_bigint().unwrap()) % m.to_bigint().unwrap())
+        .map(|v| v.to_biguint().unwrap())
+}
+// end of polynomial/modinv.rs
+
+// start of polynomial/lagrange_interpolate_at_zero.rs
+use crate::galois_fields::{gf256_add, gf256_div, gf256_mul, gf256_sub};
+
+pub fn lagrange_interpolate_at_zero(shares: &[(u8, u8)]) -> u8 {
+    let mut secret = 0u8;
+
+    for i in 0..shares.len() {
+        let (xi, yi) = shares[i];
+        let mut num = 1u8;
+        let mut den = 1u8;
+
+        for j in 0..shares.len() {
+            if i == j { continue; }
+            let (xj, _) = shares[j];
+            
+            num = gf256_mul(num, xj);
+            // In GF(256), sub is XOR, but using the function is better for the prover
+            den = gf256_mul(den, gf256_sub(xj, xi)); 
+        }
+
+        // Creusot now knows den != 0 because shares are unique
+        let li = gf256_div(num, den);
+        secret = gf256_add(secret, gf256_mul(li, yi));
+    }
+
+    secret
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Reuse GF(256) ops from same module if needed
+    use crate::galois_fields::{gf256_mul, gf256_add};
+
+    #[test]
+    fn test_lagrange_interpolate_single_share() {
+        let shares = vec![(5u8, 123u8)];
+        assert_eq!(lagrange_interpolate_at_zero(&shares), 123);
+    }
+
+    // #[test]
+    // fn test_lagrange_interpolate_two_shares_linear() {
+    //     // P(x) = 42 + 3x over GF(256)
+    //     // P(1) = 45, P(2) = 48
+    //     let shares = vec![(1, 45), (2, 48)];
+    //     let result = lagrange_interpolate_at_zero(&shares);
+    //     assert_eq!(result, 42);
+    // }
+
+    #[test]
+    fn test_lagrange_interpolate_two_shares_linear() {
+        // Define: P(x) = 42 + 3x in GF(256)
+        let p = |x: u8| gf256_add(42, gf256_mul(3, x));
+
+        let shares = vec![(1, p(1)), (2, p(2))];
+
+        let result = lagrange_interpolate_at_zero(&shares);
+        assert_eq!(result, 42);
+    }
+
+
+    #[test]
+    fn test_lagrange_interpolate_three_shares_quadratic() {
+        // P(x) = 7x² + 5x + 200
+        // Generate P(1), P(2), P(3)
+        let x_vals = [1u8, 2, 3];
+        let mut shares = Vec::new();
+        for &x in &x_vals {
+            let x2 = gf256_mul(x, x);
+            let y = gf256_add(
+                gf256_add(
+                    gf256_mul(7, x2),
+                    gf256_mul(5, x)
+                ),
+                200
+            );
+            shares.push((x, y));
+        }
+
+        let result = lagrange_interpolate_at_zero(&shares);
+        assert_eq!(result, 200);
+    }
+
+    #[test]
+    fn test_lagrange_interpolate_order_independence() {
+        // P(x) = 0x + 55, so all shares should be (x, 55)
+        let shares = vec![(1, 55), (2, 55), (3, 55)];
+        let mut reversed = shares.clone();
+        reversed.reverse();
+
+        let s1 = lagrange_interpolate_at_zero(&shares);
+        let s2 = lagrange_interpolate_at_zero(&reversed);
+
+        assert_eq!(s1, 55);
+        assert_eq!(s2, 55);
+    }
+}
+// end of polynomial/lagrange_interpolate_at_zero.rs
+
+// start of polynomial/extended_gcd.rs
+use num_bigint::{BigInt, BigUint};
+use num_traits::Zero;
+/// Extended Euclidean Algorithm to find the GCD and the coefficients.
+#[must_use]
+pub(crate) fn extended_gcd(
+    a: &BigUint,
+    b: &BigUint
+) -> (BigUint, BigInt, BigInt) {
+    let zero = BigUint::zero();
+    let mut old_r = a.clone();
+    let mut r = b.clone();
+    let mut old_s = BigInt::from(1);
+    let mut s = BigInt::from(0);
+    let mut old_t = BigInt::from(0);
+    let mut t = BigInt::from(1);
+
+    while r != zero {
+        let quotient = &old_r / &r;
+        let temp_r = old_r.clone();
+        old_r = r.clone();
+        r = temp_r - &quotient * &r;
+
+        let temp_s = old_s.clone();
+        old_s = s.clone();
+        s = temp_s - &BigInt::from(quotient.clone()) * &s;
+
+        let temp_t = old_t.clone();
+        old_t = t.clone();
+        t = temp_t - &BigInt::from(quotient) * &t;
+    }
+
+    (old_r, old_s, old_t)
+}
+
+
+use secrecy::ExposeSecret;
+use crate::types::secure_types::SecretBigUint;
+#[must_use]
+pub fn secure_extended_gcd(
+    a: &SecretBigUint,
+    b: &BigUint
+) -> (BigUint, BigInt, BigInt) {
+    let (gcd, x, y) = extended_gcd(
+        &a.expose_secret().0,
+        b
+    );
+
+    (gcd, x, y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_bigint::ToBigUint;
+
+    #[test]
+    fn test_extended_gcd() {
+        let a = 240u32.to_biguint().unwrap();
+        let b = 46u32.to_biguint().unwrap();
+
+        let (gcd, x, y) = extended_gcd(&a, &b);
+
+        assert_eq!(gcd, 2u32.to_biguint().unwrap());
+        let lhs = BigInt::from(a) * x + BigInt::from(b) * y;
+        assert_eq!(lhs, BigInt::from(gcd));
+    }
+}
+// end of polynomial/extended_gcd.rs
+

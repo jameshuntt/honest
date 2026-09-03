@@ -1,4 +1,3 @@
-/.vscode
-/.gitignore
 /target
-/experimental
+**/target
+.DS_Store
