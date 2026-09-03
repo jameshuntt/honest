@@ -97,3 +97,56 @@ fn shares_add_like_the_polynomials_they_come_from() {
     let sum_shares: Vec<(Gf256, Gf256)> = xs.iter().map(|&x| (x, evaluate(&p, x) + evaluate(&q, x))).collect();
     assert_eq!(interpolate_at_zero(&sum_shares), Ok(p[0] + q[0]));
 }
+
+mod lagrange {
+    use honest::poly::{interpolate_at_zero, lagrange_at_zero, PolyError};
+    use honest::{evaluate, Gf256};
+
+    #[test]
+    fn the_basis_dot_product_is_the_value_at_zero() {
+        let coeffs = [Gf256(0x53), Gf256(0xCA), Gf256(0x7E), Gf256(0x01)];
+        let xs = [Gf256(1), Gf256(2), Gf256(3), Gf256(4)];
+        let ys: Vec<Gf256> = xs.iter().map(|&x| evaluate(&coeffs, x)).collect();
+
+        let mut basis = [Gf256::ZERO; 4];
+        lagrange_at_zero(&xs, &mut basis).unwrap();
+        let dot = basis.iter().zip(&ys).fold(Gf256::ZERO, |acc, (&b, &y)| acc.add(b.mul(y)));
+
+        assert_eq!(dot, coeffs[0]);
+        let points: Vec<(Gf256, Gf256)> = xs.iter().copied().zip(ys).collect();
+        assert_eq!(dot, interpolate_at_zero(&points).unwrap());
+    }
+
+    #[test]
+    fn the_basis_agrees_with_interpolation_for_every_pair_of_xs() {
+        for a in 1u8..255 {
+            for b in (a + 1)..=255u8 {
+                let xs = [Gf256(a), Gf256(b)];
+                let mut basis = [Gf256::ZERO; 2];
+                lagrange_at_zero(&xs, &mut basis).unwrap();
+                // a line through (a, ya) and (b, yb): pick two values and check
+                let (ya, yb) = (Gf256(a ^ 0x5A), Gf256(b.wrapping_mul(3)));
+                let dot = basis[0].mul(ya).add(basis[1].mul(yb));
+                let via_points = interpolate_at_zero(&[(xs[0], ya), (xs[1], yb)]).unwrap();
+                assert_eq!(dot, via_points, "xs = ({a}, {b})");            }
+        }
+    }
+
+    #[test]
+    fn the_basis_sums_to_one() {
+        // Σ L_i(0) = 1 because the constant polynomial 1 interpolates itself.
+        let xs = [Gf256(9), Gf256(30), Gf256(77), Gf256(200), Gf256(255)];
+        let mut basis = [Gf256::ZERO; 5];
+        lagrange_at_zero(&xs, &mut basis).unwrap();
+        assert_eq!(basis.iter().fold(Gf256::ZERO, |acc, &b| acc.add(b)), Gf256::ONE);
+    }
+
+    #[test]
+    fn refusals() {
+        let mut out = [Gf256::ZERO; 2];
+        assert_eq!(lagrange_at_zero::<Gf256>(&[], &mut []), Err(PolyError::Empty));
+        assert_eq!(lagrange_at_zero(&[Gf256(1), Gf256(1)], &mut out), Err(PolyError::DuplicatePoint));
+        assert_eq!(lagrange_at_zero(&[Gf256(1), Gf256(2), Gf256(3)], &mut out), Err(PolyError::LengthMismatch));
+        assert_eq!(PolyError::LengthMismatch.to_string(), "output slice must have one entry per x coordinate");
+    }
+}

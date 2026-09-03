@@ -34,7 +34,7 @@ pub mod modular;
 pub mod secure;
 
 pub use gf256::{Field, Gf256};
-pub use poly::{evaluate, interpolate_at, interpolate_at_zero, PolyError};
+pub use poly::{evaluate, interpolate_at, interpolate_at_zero, lagrange_at_zero, PolyError};
 
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]

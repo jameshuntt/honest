@@ -15,6 +15,8 @@ pub enum PolyError {
     Empty,
     /// Two points share an x coordinate, so no polynomial passes through both.
     DuplicatePoint,
+    /// The output slice handed to [`lagrange_at_zero`] is not the size of the input.
+    LengthMismatch,
 }
 
 impl fmt::Display for PolyError {
@@ -22,6 +24,7 @@ impl fmt::Display for PolyError {
         match self {
             Self::Empty => write!(f, "no points to interpolate"),
             Self::DuplicatePoint => write!(f, "two points share an x coordinate"),
+            Self::LengthMismatch => write!(f, "output slice must have one entry per x coordinate"),
         }
     }
 }
@@ -70,4 +73,40 @@ pub fn interpolate_at<F: Field>(points: &[(F, F)], x: F) -> Result<F, PolyError>
 /// scheme hides there.
 pub fn interpolate_at_zero<F: Field>(points: &[(F, F)]) -> Result<F, PolyError> {
     interpolate_at(points, F::ZERO)
+}
+
+/// The Lagrange basis at zero for the x coordinates `xs`, written into
+/// `basis`: `basis[i] = Π_{j≠i} x_j / (x_j − x_i)`, so that for any
+/// polynomial `p` of degree below `xs.len()`, `p(0) = Σ basis[i] · p(xs[i])`.
+///
+/// A threshold scheme evaluates many polynomials, one per secret byte, at
+/// the same x's; computing the basis once turns each reconstruction into a
+/// dot product. Refused when `xs` is empty, repeats a value, or `basis` is
+/// not the same length as `xs`.
+pub fn lagrange_at_zero<F: Field>(xs: &[F], basis: &mut [F]) -> Result<(), PolyError> {
+    if xs.is_empty() {
+        return Err(PolyError::Empty);
+    }
+    if basis.len() != xs.len() {
+        return Err(PolyError::LengthMismatch);
+    }
+    for (i, xi) in xs.iter().enumerate() {
+        if xs[..i].contains(xi) {
+            return Err(PolyError::DuplicatePoint);
+        }
+    }
+    for (i, &xi) in xs.iter().enumerate() {
+        let mut num = F::ONE;
+        let mut den = F::ONE;
+        for (j, &xj) in xs.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            num = num.mul(F::ZERO.sub(xj));
+            den = den.mul(xi.sub(xj));
+        }
+        // `den` is a product of differences of distinct x's, hence non-zero.
+        basis[i] = num.mul(den.inv().ok_or(PolyError::DuplicatePoint)?);
+    }
+    Ok(())
 }
