@@ -64,6 +64,11 @@ random polynomials, and the modular helpers against hand-computed values.
 The multiply and power routines are `const fn` with a fixed round count, so
 their instruction sequence is the same for every input.
 
+## Releasing
+
+Bump `version` in Cargo.toml, add a dated `## <version> (YYYY-MM-DD)` entry to CHANGELOG.md, and push to
+`main`. CI (.github/workflows/ci.yml) runs the tests and clippy, then publishes that version to crates.io.
+
 ## License
 
 MIT OR Apache-2.0.
